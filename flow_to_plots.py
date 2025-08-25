@@ -6,93 +6,95 @@ import matplotlib.pyplot as plt
 XML_FILE = Path("mk-flow.xml")
 assert XML_FILE.exists(), f"{XML_FILE} not found. Run your sim first."
 
-# --- Parse FlowMonitor XML ---
-tree = ET.parse(XML_FILE)
-root = tree.getroot()
+root = ET.parse(XML_FILE).getroot()
 
+# ---- Build a classifier map: flowId -> tuple info ----
+cls_map = {}  # flowId -> dict(src,dst,proto,srcPort,dstPort)
+
+def absorb_classifier(tag_name):
+    cls = root.find(tag_name)
+    if cls is None: return
+    for f in cls.findall("Flow"):
+        fid = int(f.attrib["flowId"])
+        cls_map[fid] = {
+            "src": f.attrib.get("sourceAddress", ""),
+            "dst": f.attrib.get("destinationAddress", ""),
+            "proto": int(f.attrib.get("protocol", "0")),
+            "srcPort": f.attrib.get("sourcePort", ""),
+            "dstPort": f.attrib.get("destinationPort", ""),
+        }
+
+absorb_classifier("Ipv4FlowClassifier")
+absorb_classifier("FlowClassifier")  # fallback name in some builds
+
+# ---- Iterate stats and join with classifier ----
 rows = []
-for flow in root.iter("Flow"):
-    fid = int(flow.attrib["flowId"])
-    # ipv4 = flow.find("Ipv4FlowClassifier")
-    # five_tuple = ipv4.find("Flow")
-    ipv4 = flow.find("Ipv4FlowClassifier")
-    if ipv4 is None:
-        ipv4 = flow.find("FlowClassifier")   # fallback for your ns-3 version
-    if ipv4 is not None:
-        five_tuple = ipv4.find("Flow")
-    else:
-        continue  # skip if no classifier found
+stats_parent = root.find("FlowStats")
+if stats_parent is None:
+    # some versions nest stats per <Flow> under <FlowMonitor>
+    stats_parent = root
 
-    # 5-tuple info
-    src = five_tuple.attrib.get("sourceAddress", "")
-    dst = five_tuple.attrib.get("destinationAddress", "")
-    proto = int(five_tuple.attrib.get("protocol", "0"))
-    srcPort = five_tuple.attrib.get("sourcePort", "")
-    dstPort = five_tuple.attrib.get("destinationPort", "")
+for f in stats_parent.findall(".//Flow"):
+    fid = int(f.attrib["flowId"])
 
-    stats = flow.find("FlowStats")
-    txBytes = int(stats.attrib.get("txBytes", 0))
-    rxBytes = int(stats.attrib.get("rxBytes", 0))
-    txPackets = int(stats.attrib.get("txPackets", 0))
-    rxPackets = int(stats.attrib.get("rxPackets", 0))
-    timeFirstTx = float(stats.attrib.get("timeFirstTxPacket", 0.0))
-    timeLastRx  = float(stats.attrib.get("timeLastRxPacket", 0.0))
-    meanDelay   = float(stats.attrib.get("delaySum", 0.0)) / max(rxPackets,1)
-    meanJitter  = float(stats.attrib.get("jitterSum", 0.0)) / max(rxPackets-1,1)
+    txBytes = int(f.attrib.get("txBytes", 0))
+    rxBytes = int(f.attrib.get("rxBytes", 0))
+    txPackets = int(f.attrib.get("txPackets", 0))
+    rxPackets = int(f.attrib.get("rxPackets", 0))
+    t_first = float(f.attrib.get("timeFirstTxPacket", 0.0))
+    t_last  = float(f.attrib.get("timeLastRxPacket", 0.0))
+    delaySum = float(f.attrib.get("delaySum", 0.0))
+    jitterSum = float(f.attrib.get("jitterSum", 0.0))
 
-    duration = max(timeLastRx - timeFirstTx, 1e-9)  # seconds
-    throughput_mbps = (rxBytes * 8) / duration / 1e6
-    loss_pkts = max(txPackets - rxPackets, 0)
-    loss_pct = 100.0 * loss_pkts / txPackets if txPackets > 0 else 0.0
+    duration = max(t_last - t_first, 1e-9)
+    meanDelay = delaySum / max(rxPackets, 1)
+    meanJitter = jitterSum / max(rxPackets - 1, 1)
+    lossPkts = max(txPackets - rxPackets, 0)
+    lossPct = 100.0 * lossPkts / txPackets if txPackets > 0 else 0.0
+    throughput_Mbps = (rxBytes * 8) / duration / 1e6
 
-    proto_name = {6:"TCP", 17:"UDP"}.get(proto, str(proto))
+    c = cls_map.get(fid, {})
+    proto_num = c.get("proto", 0)
+    proto = {6: "TCP", 17: "UDP"}.get(proto_num, str(proto_num))
 
     rows.append(dict(
-        flowId=fid, proto=proto_name,
-        src=f"{src}:{srcPort}", dst=f"{dst}:{dstPort}",
-        txPackets=txPackets, rxPackets=rxPackets, lossPkts=loss_pkts, lossPct=loss_pct,
+        flowId=fid,
+        proto=proto,
+        src=f'{c.get("src","")}:{c.get("srcPort","")}',
+        dst=f'{c.get("dst","")}:{c.get("dstPort","")}',
+        txPackets=txPackets, rxPackets=rxPackets, lossPkts=lossPkts, lossPct=lossPct,
         txBytes=txBytes, rxBytes=rxBytes,
         meanDelay_s=meanDelay, meanJitter_s=meanJitter,
-        duration_s=duration, throughput_Mbps=throughput_mbps
+        duration_s=duration, throughput_Mbps=throughput_Mbps
     ))
 
-df = pd.DataFrame(rows).sort_values(["proto","flowId"]).reset_index(drop=True)
+if not rows:
+    raise SystemExit("No flows parsed. Inspect mk-flow.xml structure; did the sim produce flows?")
 
-# Save CSV
+df = pd.DataFrame(rows).sort_values(["proto","flowId"]).reset_index(drop=True)
 csv_path = Path("mk-flow-summary.csv")
 df.to_csv(csv_path, index=False)
 print(f"Saved: {csv_path.resolve()}")
 
-# Print a small summary to console
 print("\nTop flows by throughput:")
-print(df.sort_values("throughput_Mbps", ascending=False)[["flowId","proto","src","dst","throughput_Mbps"]].head(10).to_string(index=False))
+print(df.sort_values("throughput_Mbps", ascending=False)[
+    ["flowId","proto","src","dst","throughput_Mbps"]
+].head(10).to_string(index=False))
 
-# --- Plots ---
-# 1) Throughput per flow
+# ---- Plots ----
 plt.figure()
 plt.bar(df["flowId"].astype(str), df["throughput_Mbps"])
-plt.title("Throughput per flow (Mbps)")
-plt.xlabel("Flow ID")
-plt.ylabel("Mbps")
-plt.tight_layout()
+plt.title("Throughput per flow (Mbps)"); plt.xlabel("Flow ID"); plt.ylabel("Mbps"); plt.tight_layout()
 plt.savefig("mk-throughput.png")
 
-# 2) Packet loss % per flow
 plt.figure()
 plt.bar(df["flowId"].astype(str), df["lossPct"])
-plt.title("Packet loss per flow (%)")
-plt.xlabel("Flow ID")
-plt.ylabel("Loss %")
-plt.tight_layout()
+plt.title("Packet loss per flow (%)"); plt.xlabel("Flow ID"); plt.ylabel("Loss %"); plt.tight_layout()
 plt.savefig("mk-loss.png")
 
-# 3) Mean delay per flow
 plt.figure()
-plt.bar(df["flowId"].astype(str), [d*1000 for d in df["meanDelay_s"]])
-plt.title("Mean one-way delay per flow (ms)")
-plt.xlabel("Flow ID")
-plt.ylabel("ms")
-plt.tight_layout()
+plt.bar(df["flowId"].astype(str), [x*1000 for x in df["meanDelay_s"]])
+plt.title("Mean one-way delay per flow (ms)"); plt.xlabel("Flow ID"); plt.ylabel("ms"); plt.tight_layout()
 plt.savefig("mk-delay.png")
 
 print("Saved plots: mk-throughput.png, mk-loss.png, mk-delay.png")
