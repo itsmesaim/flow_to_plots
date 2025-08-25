@@ -13,8 +13,16 @@ root = tree.getroot()
 rows = []
 for flow in root.iter("Flow"):
     fid = int(flow.attrib["flowId"])
+    # ipv4 = flow.find("Ipv4FlowClassifier")
+    # five_tuple = ipv4.find("Flow")
     ipv4 = flow.find("Ipv4FlowClassifier")
-    five_tuple = ipv4.find("Flow")
+    if ipv4 is None:
+        ipv4 = flow.find("FlowClassifier")   # fallback for your ns-3 version
+    if ipv4 is not None:
+        five_tuple = ipv4.find("Flow")
+    else:
+        continue  # skip if no classifier found
+
     # 5-tuple info
     src = five_tuple.attrib.get("sourceAddress", "")
     dst = five_tuple.attrib.get("destinationAddress", "")
